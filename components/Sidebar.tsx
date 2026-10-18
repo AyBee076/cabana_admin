@@ -15,7 +15,6 @@ import {
 const links = [
   { href: '/', label: 'Dashboard', icon: SquaresFourIcon },
   { href: '/products', label: 'All products', icon: PackageIcon },
-  { href: '/products/new', label: 'Add product', icon: PlusCircleIcon },
   { href: '/categories', label: 'Categories', icon: TagIcon },
   { href: '/inventory', label: 'Inventory', icon: StackIcon },
   { href: '/settings', label: 'Settings', icon: GearIcon },
