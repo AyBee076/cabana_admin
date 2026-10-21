@@ -76,8 +76,15 @@ type FormValues = z.infer<typeof formSchema>;
 
 type Category = { id: string; name: string };
 
+type Props = {
+  productId?: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+};
+
 type DraftVariant = {
   tempId: string;
+  id?: string; // present only for variants that already exist in the DB
   size: string;
   color: string;
   stock: string;
@@ -103,38 +110,109 @@ const SECTIONS = [
   { label: "Accessories", value: "accessories" },
 ];
 
-/* -------------------------------- component -------------------------------- */
+const emptyImages: ProductImages = { front: "", back: "", detail: "" };
 
-export default function AddProductDialog() {
-  const router = useRouter();
-  const [open, setOpen] = useState(false);
-  const [categories, setCategories] = useState<Category[]>([]);
-  const [serverError, setServerError] = useState("");
+const emptyValues: FormValues = {
+  name: "",
+  description: "",
+  price: "",
+  categoryId: "",
+  fitFeatures: "",
+  fabricCare: "",
+  images: emptyImages,
+  section: "men",
+};
 
+/* ------------------------------ payload helpers ------------------------------ */
 
-  // Read the saved draft once
-  const savedDraft = useMemo(
-    () => getItem(STORAGE_KEY) as SavedDraft | undefined,
-    [],
-  );
-
-  const emptyImages: ProductImages = { front: "", back: "", detail: "" };
-
-  const form = useForm<FormValues>({
-  resolver: zodResolver(formSchema),
-  defaultValues: {
-    name: savedDraft?.name ?? "",
-    description: savedDraft?.description ?? "",
-    price: savedDraft?.price ?? "",
-    categoryId: savedDraft?.categoryId ?? "",
-    section: savedDraft?.section ?? "men",
-    fitFeatures: savedDraft?.fitFeatures ?? "",
-    fabricCare: savedDraft?.fabricCare ?? "",
-    images: savedDraft?.images ?? emptyImages,
-  },
+const buildProductPayload = (values: FormValues) => ({
+  name: values.name,
+  description: values.description,
+  price: parseFloat(values.price),
+  category_id: values.categoryId || null,
+  section: values.section,
+  image_url: values.images.front,
+  fit_features: values.fitFeatures,
+  fabric_care: values.fabricCare,
 });
 
-  // Draft variants (not saved to the database yet)
+const buildImageRows = (pid: string, images: ProductImages) => {
+  const rows = [
+    {
+      product_id: pid,
+      image_url: images.front,
+      image_type: "front",
+      is_primary: true,
+      display_order: 0,
+    },
+    {
+      product_id: pid,
+      image_url: images.back,
+      image_type: "back",
+      is_primary: false,
+      display_order: 1,
+    },
+  ];
+  if (images.detail) {
+    rows.push({
+      product_id: pid,
+      image_url: images.detail,
+      image_type: "detail",
+      is_primary: false,
+      display_order: 2,
+    });
+  }
+  return rows;
+};
+
+/* -------------------------------- component -------------------------------- */
+
+export default function ProductFormDialog({
+  productId,
+  open: controlledOpen,
+  onOpenChange,
+}: Props) {
+  const router = useRouter();
+  const isEdit = Boolean(productId);
+
+  // Works both ways: self-managed (Add button) or controlled (edit from the table)
+  const [internalOpen, setInternalOpen] = useState(false);
+  const isControlled = controlledOpen !== undefined;
+  const open = isControlled ? controlledOpen : internalOpen;
+  const setOpen = (value: boolean) => {
+    if (isControlled) onOpenChange?.(value);
+    else setInternalOpen(value);
+  };
+
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [serverError, setServerError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [originalVariantIds, setOriginalVariantIds] = useState<string[]>([]);
+  // Bumped after a product loads so the image uploader remounts with the loaded URLs
+  const [imagesKey, setImagesKey] = useState(0);
+
+  // Read the saved draft once (create mode only, so editing never touches it)
+  const savedDraft = useMemo(
+    () =>
+      isEdit ? undefined : (getItem(STORAGE_KEY) as SavedDraft | undefined),
+    [isEdit],
+  );
+
+  const form = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: {
+      name: savedDraft?.name ?? "",
+      description: savedDraft?.description ?? "",
+      price: savedDraft?.price ?? "",
+      categoryId: savedDraft?.categoryId ?? "",
+      section: savedDraft?.section ?? "men",
+      fitFeatures: savedDraft?.fitFeatures ?? "",
+      fabricCare: savedDraft?.fabricCare ?? "",
+      images: savedDraft?.images ?? emptyImages,
+    },
+  });
+
+  // Variants (draft ones have no id; ones loaded from the DB do)
   const [variants, setVariants] = useState<DraftVariant[]>(
     savedDraft?.variants ?? [],
   );
@@ -159,13 +237,92 @@ export default function AddProductDialog() {
     };
   }, []);
 
+  /* --------------------------- load product (edit) --------------------------- */
+
+  useEffect(() => {
+    if (!open || !productId) return;
+    let ignore = false;
+
+    const load = async () => {
+      setLoading(true);
+      setServerError("");
+      const supabase = createClient();
+
+      const [productRes, imagesRes, variantsRes] = await Promise.all([
+        supabase.from("products").select("*").eq("id", productId).single(),
+        supabase
+          .from("products_images")
+          .select("image_url, image_type")
+          .eq("product_id", productId),
+        supabase
+          .from("product_variants")
+          .select("id, size, color, stock")
+          .eq("product_id", productId),
+      ]);
+
+      if (ignore) return;
+
+      if (productRes.error || !productRes.data) {
+        console.error("Load product failed:", productRes.error);
+        setServerError(productRes.error?.message ?? "Could not load product.");
+        setLoading(false);
+        return;
+      }
+
+      if (imagesRes.error) {
+        console.error("Load images failed:", imagesRes.error);
+      }
+
+      const p = productRes.data;
+      const imgs = imagesRes.data ?? [];
+      const urlOf = (type: string) =>
+        imgs.find((i) => i.image_type === type)?.image_url ?? "";
+
+      form.reset({
+        name: p.name ?? "",
+        description: p.description ?? "",
+        price: String(p.price ?? ""),
+        categoryId: p.category_id ?? "",
+        section: p.section ?? "men",
+        fitFeatures: p.fit_features ?? "",
+        fabricCare: p.fabric_care ?? "",
+        images: {
+          front: urlOf("front") || p.image_url || "",
+          back: urlOf("back"),
+          detail: urlOf("detail"),
+        },
+      });
+      setImagesKey((k) => k + 1);
+
+      const vars = variantsRes.data ?? [];
+      setVariants(
+        vars.map((v) => ({
+          tempId: v.id,
+          id: v.id,
+          size: v.size,
+          color: v.color,
+          stock: String(v.stock),
+        })),
+      );
+      setOriginalVariantIds(vars.map((v) => v.id));
+      setLoading(false);
+    };
+
+    load();
+    return () => {
+      ignore = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, productId]);
+
   /* ----------------------------- draft in storage ----------------------------- */
 
   const watched = useWatch({ control: form.control });
 
   useEffect(() => {
+    if (isEdit) return; // never overwrite the "new product" draft while editing
     setItem(STORAGE_KEY, { ...watched, variants, vSize, vColor, vStock });
-  }, [watched, variants, vSize, vColor, vStock]);
+  }, [isEdit, watched, variants, vSize, vColor, vStock]);
 
   const clearDraft = () => {
     try {
@@ -197,26 +354,121 @@ export default function AddProductDialog() {
     setVariants((prev) => prev.filter((v) => v.tempId !== tempId));
   };
 
-  /* --------------------------------- submit --------------------------------- */
+  /* --------------------------------- update --------------------------------- */
 
-  async function onSubmit(values: FormValues) {
-    setServerError("");
+  async function updateProduct(values: FormValues) {
+    const supabase = createClient();
+    const pid = productId!;
+
+    // 1. product row
+    const { error: productError } = await supabase
+      .from("products")
+      .update(buildProductPayload(values))
+      .eq("id", pid);
+    if (productError) {
+      setServerError(productError.message);
+      return;
+    }
+
+    // 2. images: replace the set.
+    // With RLS, a delete that isn't allowed returns NO error and removes
+    // 0 rows, so we count the rows before and after to make sure the old
+    // images are really gone before inserting the new ones.
+    const { data: existingImgs } = await supabase
+      .from("products_images")
+      .select("*")
+      .eq("product_id", pid);
+
+    const { data: deletedImgs, error: delImgErr } = await supabase
+      .from("products_images")
+      .delete()
+      .eq("product_id", pid)
+      .select();
+    if (delImgErr) {
+      setServerError(`Images: ${delImgErr.message}`);
+      return;
+    }
+
+    if ((deletedImgs?.length ?? 0) < (existingImgs?.length ?? 0)) {
+      console.error("Old images were not deleted", {
+        existing: existingImgs?.length,
+        deleted: deletedImgs?.length,
+      });
+      setServerError(
+        "Product saved, but the old images could not be removed. Add a DELETE policy on products_images in Supabase, then save again.",
+      );
+      return;
+    }
+
+    const { error: insImgErr } = await supabase
+      .from("products_images")
+      .insert(buildImageRows(pid, values.images));
+    if (insImgErr) {
+      setServerError(`Images: ${insImgErr.message}`);
+      return;
+    }
+
+    // 3. variants: diff instead of delete-all
+    const currentIds = variants.filter((v) => v.id).map((v) => v.id!);
+    const removedIds = originalVariantIds.filter(
+      (id) => !currentIds.includes(id),
+    );
+
+    if (removedIds.length > 0) {
+      const { error } = await supabase
+        .from("product_variants")
+        .delete()
+        .in("id", removedIds);
+      if (error) {
+        setServerError(`Variants: ${error.message}`);
+        return;
+      }
+    }
+
+    for (const v of variants.filter((v) => v.id)) {
+      const { error } = await supabase
+        .from("product_variants")
+        .update({
+          size: v.size,
+          color: v.color,
+          stock: parseInt(v.stock, 10) || 0,
+        })
+        .eq("id", v.id!);
+      if (error) {
+        setServerError(`Variants: ${error.message}`);
+        return;
+      }
+    }
+
+    const newOnes = variants.filter((v) => !v.id);
+    if (newOnes.length > 0) {
+      const { error } = await supabase.from("product_variants").insert(
+        newOnes.map((v) => ({
+          product_id: pid,
+          size: v.size,
+          color: v.color,
+          stock: parseInt(v.stock, 10) || 0,
+        })),
+      );
+      if (error) {
+        setServerError(`Variants: ${error.message}`);
+        return;
+      }
+    }
+
+    setOpen(false);
+    router.refresh();
+  }
+
+  /* --------------------------------- create --------------------------------- */
+
+  async function createProduct(values: FormValues) {
     const supabase = createClient();
 
     // Step 1: insert the product and get its new id back
     const { data: product, error: productError } = await supabase
       .from("products")
-      .insert({
-  name: values.name,
-  description: values.description,
-  price: parseFloat(values.price),
-  category_id: values.categoryId || null,
-  section: values.section, // <-- add this
-  image_url: values.images.front,
-  is_deleted: false,
-  fit_features: values.fitFeatures,
-  fabric_care: values.fabricCare,
-})
+      .insert({ ...buildProductPayload(values), is_deleted: false })
       .select()
       .single();
 
@@ -226,36 +478,10 @@ export default function AddProductDialog() {
       return;
     }
 
-    // Step 2: insert the front/back/detail rows into product_images
-    const imageRows = [
-  {
-    product_id: product.id,
-    image_url: values.images.front,
-    image_type: "front",
-    is_primary: true,
-    display_order: 0,
-  },
-  {
-    product_id: product.id,
-    image_url: values.images.back,
-    image_type: "back",
-    is_primary: false,
-    display_order: 1,
-  },
-];
-if (values.images.detail) {
-  imageRows.push({
-    product_id: product.id,
-    image_url: values.images.detail,
-    image_type: "detail",
-    is_primary: false,
-    display_order: 2,
-  });
-}
-
+    // Step 2: insert the front/back/detail rows into products_images
     const { error: imagesError } = await supabase
       .from("products_images")
-      .insert(imageRows);
+      .insert(buildImageRows(product.id, values.images));
 
     if (imagesError) {
       console.error(
@@ -287,23 +513,14 @@ if (values.images.detail) {
           JSON.stringify(variantError, null, 2),
         );
         setServerError(
-          `Product and images saved, but variants failed: ${variantError.message}. You can add them from the edit page.`,
+          `Product and images saved, but variants failed: ${variantError.message}. You can add them by editing the product.`,
         );
         return;
       }
     }
 
     clearDraft();
-    form.reset({
-      name: "",
-      description: "",
-      price: "",
-      categoryId: "",
-      fitFeatures: "",
-      fabricCare: "",
-      images: emptyImages,
-      section: "men"
-    });
+    form.reset(emptyValues);
     setVariants([]);
     setVSize("");
     setVColor("");
@@ -313,27 +530,49 @@ if (values.images.detail) {
     router.refresh();
   }
 
+  /* --------------------------------- submit --------------------------------- */
+
+  async function onSubmit(values: FormValues) {
+    setServerError("");
+    if (isEdit) {
+      await updateProduct(values);
+    } else {
+      await createProduct(values);
+    }
+  }
+
   const { isSubmitting } = form.formState;
 
   /* ---------------------------------- view ---------------------------------- */
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger
-        render={<Button variant="outline"> + Add product</Button>}
-      />
+      {!isEdit && (
+        <DialogTrigger
+          render={<Button variant="outline"> + Add product</Button>}
+        />
+      )}
 
       <DialogContent className="sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>Add product</DialogTitle>
+          <DialogTitle>{isEdit ? "Edit product" : "Add product"}</DialogTitle>
           <DialogDescription>
-            Fill in the details, upload images, and add the sizes and colors you
-            stock.
+            {isEdit
+              ? "Update the details, images, sizes and colors for this product."
+              : "Fill in the details, upload images, and add the sizes and colors you stock."}
           </DialogDescription>
         </DialogHeader>
 
+        {loading && (
+          <p className="text-sm text-muted-foreground">Loading product…</p>
+        )}
+
         {/* Scrollable body so long forms don't overflow the screen */}
-        <div className="max-h-[65vh] overflow-y-auto pr-1">
+        <div
+          className={`max-h-[65vh] overflow-y-auto pr-1 ${
+            loading ? "pointer-events-none opacity-50" : ""
+          }`}
+        >
           <form id="product-form" onSubmit={form.handleSubmit(onSubmit)}>
             <FieldGroup>
               <Controller
@@ -511,6 +750,7 @@ if (values.images.detail) {
                   <Field data-invalid={fieldState.invalid}>
                     <FieldLabel>Product images</FieldLabel>
                     <ProductImagesUpload
+                      key={imagesKey}
                       value={field.value}
                       onChange={field.onChange}
                     />
@@ -523,7 +763,7 @@ if (values.images.detail) {
 
               <FieldSeparator />
 
-              {/* Draft variants */}
+              {/* Variants */}
               <FieldSet>
                 <FieldLegend variant="label">
                   Variants (size, color, stock)
@@ -605,31 +845,41 @@ if (values.images.detail) {
         {serverError && (
           <p className="text-sm text-destructive">{serverError}</p>
         )}
+
         {/* Outside the <form>, so the submit button points to it with form="" */}
         <DialogFooter>
+          {isEdit ? (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setOpen(false)}
+            >
+              Cancel
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                form.reset(emptyValues);
+                setVariants([]);
+                setServerError("");
+                clearDraft();
+              }}
+            >
+              Reset
+            </Button>
+          )}
           <Button
-            type="button"
-            variant="outline"
-            onClick={() => {
-              form.reset({
-                name: "",
-                description: "",
-                price: "",
-                categoryId: "",
-                fitFeatures: "",
-                fabricCare: "",
-                images: emptyImages,
-                section: "men"
-              });
-              setVariants([]);
-              setServerError("");
-              clearDraft();
-            }}
+            type="submit"
+            form="product-form"
+            disabled={isSubmitting || loading}
           >
-            Reset
-          </Button>
-          <Button type="submit" form="product-form" disabled={isSubmitting}>
-            {isSubmitting ? "Saving..." : "Save product"}
+            {isSubmitting
+              ? "Saving..."
+              : isEdit
+                ? "Save changes"
+                : "Save product"}
           </Button>
         </DialogFooter>
       </DialogContent>
